@@ -12,6 +12,8 @@ from dotenv import load_dotenv
 from streamlit_local_storage import LocalStorage
 
 from flags import CRITERIA, audit_flags
+from industry import industry_label
+from kam import split_kam
 
 load_dotenv()  # 로컬 개발용 기본 키. 배포 시에는 사용자가 직접 입력
 BASE = "https://opendart.fss.or.kr/api"
@@ -80,6 +82,38 @@ def load_audit(_key, corp_code, year):
     return sorted(out, key=lambda x: x["year"])
 
 
+@st.cache_data(show_spinner=False, ttl=7 * 86400)
+def load_industry(_key, corp_code):
+    r = requests.get(f"{BASE}/company.json", params={"crtfc_key": _key, "corp_code": corp_code}, timeout=30).json()
+    if r["status"] != "000":  # 예외는 캐시되지 않으므로 일시 오류가 오래 남지 않음
+        raise ValueError(r["message"])
+    return r.get("induty_code", "")
+
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def load_audit_reports(_key, corp_code):
+    """감사보고서(공시유형 F) 최근 목록. 사업보고서가 없는 비상장 외부감사 대상 기업용."""
+    r = requests.get(f"{BASE}/list.json", timeout=30, params={
+        "crtfc_key": _key, "corp_code": corp_code, "pblntf_ty": "F", "page_count": 10,
+        "bgn_de": f"{date.today().year - 5}0101", "end_de": date.today().strftime("%Y%m%d")}).json()
+    if r["status"] == "013":
+        return []
+    if r["status"] != "000":
+        raise ValueError(f"DART 오류 {r['status']}: {r['message']}")
+    return r["list"]
+
+
+def industry_text(key, corp_code):
+    try:
+        return industry_label(load_industry(key, corp_code))
+    except (ValueError, requests.RequestException):
+        return "업종 미확인"
+
+
+def corp_label(key, r):
+    return f"{r['name']} ({r['stock_code'] or '비상장'}) · {industry_text(key, r['corp_code'])}"
+
+
 def latest_audit(key, corp_code):
     """가장 최근 사업보고서 연도와 그 감사정보. 올해 보고서가 아직 없으면 전년도로."""
     for y in (date.today().year - 1, date.today().year - 2):
@@ -142,7 +176,8 @@ if q:
     if m.empty:
         st.warning("검색 결과가 없습니다.")
     else:
-        label = m.apply(lambda r: f"{r['name']} ({r['stock_code'] or '비상장'})", axis=1)
+        with st.spinner("업종 조회 중..."):
+            label = m.apply(lambda r: corp_label(key, r), axis=1)
         i = st.selectbox("검색 결과", range(len(m)), format_func=lambda n: label.iloc[n])
         c = m.iloc[i]
         pick = {"corp_code": c["corp_code"], "name": c["name"], "stock_code": c["stock_code"]}
@@ -155,12 +190,28 @@ if not history or history[0]["corp_code"] != pick["corp_code"]:
     store.setItem("history", json.dumps(new[:10], ensure_ascii=False), key="save")
 
 st.subheader(pick["name"])
+st.caption("업종: " + industry_text(key, pick["corp_code"]))
 fs_div = st.radio("재무제표", ["CFS", "OFS"], format_func=lambda v: "연결" if v == "CFS" else "별도", horizontal=True)
 try:
     last, audits = latest_audit(key, pick["corp_code"])
     rows = trend(key, pick["corp_code"], fs_div, last)
 except (ValueError, requests.RequestException) as e:
     st.error(str(e))
+    st.stop()
+if not rows and not audits:
+    st.info("이 기업은 사업보고서가 없어 재무 추이와 감사정보를 자동으로 보여줄 수 없습니다. "
+            "비상장 외부감사 대상 기업은 사업보고서 없이 감사보고서만 제출하는 경우가 많습니다. "
+            "아래 감사보고서 원문을 DART에서 직접 확인하세요.")
+    try:
+        reports = load_audit_reports(key, pick["corp_code"])
+    except (ValueError, requests.RequestException) as e:
+        st.error(str(e))
+        st.stop()
+    if not reports:
+        st.warning("최근 5년 내 감사보고서도 찾지 못했습니다.")
+    for rep in reports:
+        st.markdown(f"- [{rep['report_nm']}](https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rep['rcept_no']})"
+                    f" · 제출 {rep['flr_nm']} · 접수 {rep['rcept_dt']}")
     st.stop()
 if not rows:
     st.warning("해당 재무제표 데이터가 없습니다. (연결재무제표가 없는 기업일 수 있음)")
@@ -200,5 +251,8 @@ with tab_audit:
         st.dataframe(pd.DataFrame(table).set_index("사업연도"), use_container_width=True)
         for a in reversed(audits):
             with st.expander(f"{a['year']} 핵심감사사항 (KAM)", expanded=a is audits[-1]):
-                st.text(a["kam"])
+                for part, body in split_kam(a["kam"]):
+                    if part:
+                        st.markdown(f"**{part}**")
+                    st.text(body)
         st.caption(f"{audits[0]['year']}년 감사인은 변경 여부를 비교할 이전 연도가 없어 '-'로 표시됩니다. 출처: DART 사업보고서.")
