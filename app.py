@@ -57,8 +57,8 @@ def load_fs(_key, corp_code, year, fs_div):
         raise ValueError(f"DART 오류 {r['status']}: {r['message']}")
     out = {}
     for k, (ids, tables) in ACCOUNTS.items():
-        for a in r["list"]:
-            if a["account_id"] in ids and a["sj_div"] in tables and a.get("thstrm_amount", "").strip("-").replace(",", "").isdigit():
+        for a in r["list"]:  # 항목 키가 빠질 수 있어 account_id·sj_div는 get으로 읽는다
+            if a.get("account_id") in ids and a.get("sj_div") in tables and a.get("thstrm_amount", "").strip("-").replace(",", "").isdigit():
                 out[k] = int(a["thstrm_amount"].replace(",", ""))
                 break
     return out
@@ -77,8 +77,13 @@ def load_audit(_key, corp_code, year):
     for a in r["list"]:
         label = a["bsns_year"]
         back = 2 if "전전기" in label else 1 if "전기" in label else 0
-        out.append({"year": year - back, "auditor": a["adtor"].strip(), "opinion": a["adt_opinion"].strip(),
-                    "emphasis": a["emphs_matter"].strip(), "kam": a["core_adt_matter"].strip()})
+        # 강조사항·KAM이 없는 연도는 DART가 항목 자체를 빼고 보내므로 get 사용
+        rec = {"year": year - back, "auditor": a.get("adtor", "").strip(), "opinion": a.get("adt_opinion", "").strip(),
+               "emphasis": a.get("emphs_matter", "").strip(), "kam": a.get("core_adt_matter", "").strip()}
+        # 최근 보고서는 같은 연도가 2건(연결/별도로 추정, API에 구분 필드 없음) 동일 내용으로 오므로 중복 제거.
+        # 내용이 다르면 둘 다 남겨 의견·KAM 차이를 놓치지 않는다.
+        if rec not in out:
+            out.append(rec)
     return sorted(out, key=lambda x: x["year"])
 
 
@@ -232,7 +237,7 @@ with tab_fin:
     money = [v for k, v in LABELS.items() if k != "debt_ratio"]
     df[money] = df[money] / UNIT
     st.dataframe(df.T.style.format("{:,.0f}", na_rep="N/A")
-                 .format("{:,.1f}", subset=pd.IndexSlice[["부채비율(%)"], :], na_rep="N/A"), use_container_width=True)
+                 .format("{:,.1f}", subset=pd.IndexSlice[["부채비율(%)"], :], na_rep="N/A"), width="stretch")
     for cols, names in ((st.columns(3), money[:3]), (st.columns(2), [money[3], "부채비율(%)"])):
         for col, name in zip(cols, names):
             col.markdown(f"**{name}**" + ("" if "%" in name else " (억원)"))
@@ -248,7 +253,7 @@ with tab_audit:
             changed = i > 0 and a["auditor"] != audits[i - 1]["auditor"]
             table.append({"사업연도": a["year"], "감사인": a["auditor"], "감사인 변경": "변경" if changed else "-",
                           "감사의견": a["opinion"], "강조사항": a["emphasis"]})
-        st.dataframe(pd.DataFrame(table).set_index("사업연도"), use_container_width=True)
+        st.dataframe(pd.DataFrame(table).set_index("사업연도"), width="stretch")
         for a in reversed(audits):
             with st.expander(f"{a['year']} 핵심감사사항 (KAM)", expanded=a is audits[-1]):
                 for part, body in split_kam(a["kam"]):
